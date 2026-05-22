@@ -226,6 +226,7 @@ jobs:
 If this tool saved you time or helped you find a real bug, consider a donation:
 
 **Bitcoin:** `39vZWmnUwDReQ15BwqQXzyqVQ6U8LardEf`
+**PayPal:** [paypal.me/Freakbank1](https://paypal.me/Freakbank1)
 
 ---
 
