@@ -1,28 +1,28 @@
 # subdomain-takeover-scanner
 
-A comprehensive, concurrent **subdomain takeover vulnerability scanner** written in pure Python 3 (stdlib only).  
-Checks 35+ provider fingerprints, detects dangling CNAMEs, and classifies findings by severity.
+Ein umfassender, parallelisierter **Subdomain-Takeover-Scanner** in reinem Python 3 — keine externen Abhängigkeiten nötig.  
+Prüft über 35 Provider-Fingerprints, erkennt hängende CNAMEs und stuft Befunde nach Schweregrad ein.
 
-> **Legal Disclaimer:** This tool is intended for authorized security assessments, bug bounty programs, and educational use only. Never use it against systems you do not own or have explicit written permission to test. The author accepts no liability for misuse.
+> **Rechtlicher Hinweis:** Dieses Tool ist ausschließlich für autorisierte Sicherheitsanalysen, Bug-Bounty-Programme und Bildungszwecke gedacht. Niemals gegen Systeme einsetzen, für die keine ausdrückliche schriftliche Genehmigung vorliegt. Der Autor übernimmt keine Haftung für Missbrauch.
 
 ---
 
-## What Is Subdomain Takeover?
+## Was ist ein Subdomain Takeover?
 
-A **subdomain takeover** occurs when a DNS record (typically a CNAME) points to a third-party service (e.g. GitHub Pages, Heroku, AWS S3) whose account or resource has been deleted or never created — leaving the subdomain "dangling". An attacker can register that resource and serve arbitrary content from your subdomain.
+Ein **Subdomain Takeover** tritt auf, wenn ein DNS-Eintrag (typischerweise ein CNAME) auf einen Drittanbieter-Dienst zeigt (z. B. GitHub Pages, Heroku, AWS S3), dessen Account oder Ressource gelöscht wurde oder nie existiert hat — die Subdomain "hängt" damit ins Leere. Ein Angreifer kann diese Ressource registrieren und beliebige Inhalte über die betroffene Subdomain ausliefern.
 
-### Impact
+### Mögliche Auswirkungen
 
-| Scenario | Risk |
+| Szenario | Risiko |
 |---|---|
-| Full control of `shop.victim.com` | Phishing, credential harvesting |
-| Cookie scope hijack | Session theft (cookies scoped to `*.victim.com`) |
-| CSP / SRI bypass | Load attacker JS from trusted subdomain |
-| Email spoofing | Send mail from the trusted domain |
-| Reputation damage | Defacement, malware hosting |
+| Vollständige Kontrolle über `shop.opfer.com` | Phishing, Credential Harvesting |
+| Cookie-Scope-Hijacking | Session-Diebstahl (Cookies mit `*.opfer.com`-Scope) |
+| CSP / SRI umgehen | Angreifer-JS von vertrauenswürdiger Subdomain nachladen |
+| E-Mail-Spoofing | Mails von der vertrauenswürdigen Domain versenden |
+| Reputationsschaden | Defacement, Malware-Hosting |
 
-### Further Reading
-- [EdOverflow — can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz) — the canonical reference for provider fingerprints
+### Weiterführende Quellen
+- [EdOverflow — can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz) — die Referenzliste für Provider-Fingerprints
 - [HackerOne — Subdomain Takeover](https://www.hackerone.com/blog/Guide-Subdomain-Takeovers)
 - [OWASP Testing Guide — Subdomain Takeover](https://owasp.org/www-project-web-security-testing-guide/)
 
@@ -30,20 +30,20 @@ A **subdomain takeover** occurs when a DNS record (typically a CNAME) points to 
 
 ## Features
 
-- **35+ provider fingerprints** (AWS S3, GitHub Pages, Heroku, Netlify, Azure, Vercel, …)
-- **NXDOMAIN detection** — dangling CNAME + NXDOMAIN = CRITICAL
-- **Concurrent scanning** — ThreadPoolExecutor, configurable worker count (default 20)
-- **Severity classification** — CRITICAL / HIGH / MEDIUM / INFO / SAFE
-- **Coloured terminal output** with progress bar
-- **JSON and CSV export**
-- **stdlib only** — no external dependencies required
-- Optional `dnspython` for more reliable CNAME resolution (auto-detected)
+- **35+ Provider-Fingerprints** (AWS S3, GitHub Pages, Heroku, Netlify, Azure, Vercel, …)
+- **NXDOMAIN-Erkennung** — hängender CNAME + NXDOMAIN = CRITICAL
+- **Paralleles Scanning** — ThreadPoolExecutor, einstellbare Worker-Anzahl (Standard: 20)
+- **Schweregrad-Klassifizierung** — CRITICAL / HIGH / MEDIUM / INFO / SAFE
+- **Farbige Terminalausgabe** mit Fortschrittsbalken
+- **JSON- und CSV-Export**
+- **Nur stdlib** — keine externen Abhängigkeiten
+- Optional `dnspython` für zuverlässigere CNAME-Auflösung (wird automatisch erkannt)
 
 ---
 
-## Supported Provider Fingerprints
+## Unterstützte Provider-Fingerprints
 
-| # | Provider | CNAME Pattern(s) | HTTP Fingerprint |
+| # | Provider | CNAME-Pattern(s) | HTTP-Fingerprint |
 |---|---|---|---|
 | 1 | AWS S3 | `s3.amazonaws.com`, `s3-website` | `NoSuchBucket` |
 | 2 | GitHub Pages | `github.io`, `github.com` | `There isn't a GitHub Pages site here` |
@@ -89,28 +89,28 @@ A **subdomain takeover** occurs when a DNS record (typically a CNAME) points to 
 git clone https://github.com/G4MEOVER18/subdomain-takeover-scanner.git
 cd subdomain-takeover-scanner
 
-# No external dependencies required (stdlib only).
-# Optional: install dnspython for better CNAME resolution:
+# Keine externen Abhängigkeiten nötig (stdlib only).
+# Optional: dnspython für bessere CNAME-Auflösung installieren:
 pip install dnspython
 ```
 
 ---
 
-## Usage
+## Verwendung
 
-### Enumerate subdomains from a wordlist
+### Subdomains aus einer Wordlist enumerieren
 
 ```bash
 python takeover.py --domain example.com --wordlist wordlist.txt
 ```
 
-### Scan a pre-built list of hostnames
+### Fertige Hostname-Liste scannen
 
 ```bash
 python takeover.py --list subdomains.txt
 ```
 
-### Export results
+### Ergebnisse exportieren
 
 ```bash
 python takeover.py --domain example.com --wordlist wordlist.txt \
@@ -118,68 +118,68 @@ python takeover.py --domain example.com --wordlist wordlist.txt \
   --csv  results.csv
 ```
 
-### Show only critical/high findings (CI mode)
+### Nur kritische/hohe Befunde anzeigen (CI-Modus)
 
 ```bash
 python takeover.py --list targets.txt --only-vulnerable
 ```
 
-### Increase concurrency
+### Parallelität erhöhen
 
 ```bash
 python takeover.py --domain bigcorp.com --wordlist wordlist.txt --workers 50
 ```
 
-### List all built-in provider fingerprints
+### Alle integrierten Provider-Fingerprints auflisten
 
 ```bash
 python takeover.py --providers
 ```
 
-### Full options
+### Alle Optionen
 
 ```
 usage: takeover.py [-h] [--domain DOMAIN] [--wordlist FILE] [--list FILE]
                    [--workers N] [--json FILE] [--csv FILE] [--no-color]
                    [--only-vulnerable] [--timeout SEC] [--providers]
 
-  --domain,    -d  Base domain (combine with --wordlist for enumeration)
-  --wordlist,  -w  Wordlist file (one prefix per line)
-  --list,      -l  File with full hostnames (one per line)
-  --workers,   -t  Concurrent threads (default: 20)
-  --json           Write JSON report to FILE
-  --csv            Write CSV report to FILE
-  --no-color       Disable ANSI colour output
-  --only-vulnerable  Print only CRITICAL and HIGH findings
-  --timeout        HTTP timeout in seconds (default: 8)
-  --providers      Print provider fingerprint table and exit
+  --domain,    -d  Basis-Domain (kombiniert mit --wordlist für Enumeration)
+  --wordlist,  -w  Wordlist-Datei (ein Prefix pro Zeile)
+  --list,      -l  Datei mit vollständigen Hostnamen (ein pro Zeile)
+  --workers,   -t  Parallele Threads (Standard: 20)
+  --json           JSON-Report in FILE schreiben
+  --csv            CSV-Report in FILE schreiben
+  --no-color       ANSI-Farbausgabe deaktivieren
+  --only-vulnerable  Nur CRITICAL- und HIGH-Befunde ausgeben
+  --timeout        HTTP-Timeout in Sekunden (Standard: 8)
+  --providers      Provider-Fingerprint-Tabelle ausgeben und beenden
 ```
 
 ---
 
-## Severity Levels
+## Schweregrade
 
-| Severity | Meaning | Action |
+| Schweregrad | Bedeutung | Empfohlene Maßnahme |
 |---|---|---|
-| **CRITICAL** | Dangling CNAME + NXDOMAIN. The subdomain almost certainly can be claimed immediately. | Claim the resource NOW or remove the DNS record. |
-| **HIGH** | HTTP fingerprint matched — service is configured to respond with "not found" message for unclaimed slot. | High confidence takeover possible. Claim or remove. |
-| **MEDIUM** | CNAME points to a known provider but fingerprint not confirmed (may be protected or temporarily down). | Manual verification recommended. |
-| **INFO** | DNS resolution failed, no CNAME, or NXDOMAIN without a dangling CNAME. | Low risk. |
-| **SAFE** | Resolved to an IP, no known provider detected. | No action needed. |
+| **CRITICAL** | Hängender CNAME + NXDOMAIN — die Subdomain kann mit hoher Wahrscheinlichkeit sofort übernommen werden. | Ressource jetzt registrieren oder DNS-Eintrag entfernen. |
+| **HIGH** | HTTP-Fingerprint erkannt — Dienst antwortet mit "nicht gefunden"-Meldung für unbeanspruchten Slot. | Übernahme wahrscheinlich möglich. Registrieren oder entfernen. |
+| **MEDIUM** | CNAME zeigt auf bekannten Provider, Fingerprint aber nicht bestätigt (ggf. geschützt oder vorübergehend offline). | Manuelle Überprüfung empfohlen. |
+| **INFO** | DNS-Auflösung fehlgeschlagen, kein CNAME, oder NXDOMAIN ohne hängenden CNAME. | Geringes Risiko. |
+| **SAFE** | Zu einer IP aufgelöst, kein bekannter Provider erkannt. | Kein Handlungsbedarf. |
 
 ---
 
-## Exit Codes
+## Exit-Codes
 
-| Code | Meaning |
+| Code | Bedeutung |
 |---|---|
-| `0` | Scan completed, no CRITICAL or HIGH findings |
-| `1` | At least one CRITICAL or HIGH finding detected |
-| `2` | Usage error or file not found |
+| `0` | Scan abgeschlossen, keine CRITICAL- oder HIGH-Befunde |
+| `1` | Mindestens ein CRITICAL- oder HIGH-Befund gefunden |
+| `2` | Nutzungsfehler oder Datei nicht gefunden |
 
 ---
 
-## CI/CD Integration
+## CI/CD-Integration
 
 ```yaml
 # .github/workflows/takeover-check.yml
@@ -187,7 +187,7 @@ name: Subdomain Takeover Check
 
 on:
   schedule:
-    - cron: "0 6 * * 1"   # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"   # Jeden Montag um 06:00 UTC
   push:
     branches: [main]
 
@@ -197,21 +197,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Python einrichten
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run scanner
+      - name: Scanner ausführen
         run: |
           python takeover.py \
             --domain ${{ vars.TARGET_DOMAIN }} \
             --wordlist wordlist.txt \
             --only-vulnerable \
             --json results.json
-        # Exit code 1 → CI fails when CRITICAL/HIGH found
+        # Exit-Code 1 → CI schlägt fehl, wenn CRITICAL/HIGH gefunden
 
-      - name: Upload results
+      - name: Ergebnisse hochladen
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -221,17 +221,17 @@ jobs:
 
 ---
 
-## Donations
+## Spenden
 
-If this tool saved you time or helped you find a real bug, consider a donation:
+Wenn dir das Tool Zeit gespart oder einen echten Bug gebracht hat, freue ich mich über eine kleine Spende:
 
 **Bitcoin:** `39vZWmnUwDReQ15BwqQXzyqVQ6U8LardEf`
 **PayPal:** [paypal.me/Freakbank1](https://paypal.me/Freakbank1)
 
 ---
 
-## License
+## Lizenz
 
 MIT License — Copyright (c) 2026 G4MEOVER18
 
-See [LICENSE](LICENSE) for full terms.
+Vollständige Bedingungen: [LICENSE](LICENSE)
