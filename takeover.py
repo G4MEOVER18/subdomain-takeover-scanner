@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -201,6 +202,9 @@ for _p in PROVIDERS:
     for _pat in _p.cname_patterns:
         _CNAME_INDEX[_pat.lower()] = _p
 
+# Configurable DNS servers (overridable via --dns)
+_DNS_SERVERS: List[str] = ["8.8.8.8", "1.1.1.1"]
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -213,43 +217,29 @@ SEVERITY_SAFE     = "SAFE"
 @dataclass
 class ScanResult:
     subdomain: str
-    cname: Optional[str]       = None
-    ip: Optional[str]          = None
-    provider: Optional[str]    = None
-    nxdomain: bool             = False
-    http_status: Optional[int] = None
-    fingerprint_match: bool    = False
-    severity: str              = SEVERITY_INFO
-    detail: str                = ""
-    error: Optional[str]       = None
+    cname: Optional[str]          = None
+    cname_chain: List[str]        = field(default_factory=list)
+    chain_depth: int              = 0
+    ip: Optional[str]             = None
+    provider: Optional[str]       = None
+    nxdomain: bool                = False
+    http_status: Optional[int]    = None
+    fingerprint_match: bool       = False
+    tls_sans: List[str]           = field(default_factory=list)
+    severity: str                 = SEVERITY_INFO
+    detail: str                   = ""
+    error: Optional[str]          = None
 
 # ---------------------------------------------------------------------------
 # DNS helpers
 # ---------------------------------------------------------------------------
-def resolve_cname(host: str) -> Optional[str]:
-    """Follow CNAME chain via getaddrinfo / manual query.
-    Falls back to a raw DNS CNAME lookup using socket tricks."""
-    try:
-        # Try dnspython if available
-        import dns.resolver  # type: ignore
-        answers = dns.resolver.resolve(host, "CNAME")
-        return str(answers[0].target).rstrip(".")
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # stdlib fallback: socket cannot do CNAME, but we try anyway
-    # via a raw UDP DNS packet (type CNAME = 5)
-    try:
-        return _raw_cname_query(host)
-    except Exception:
-        return None
-
-
-def _raw_cname_query(host: str, timeout: float = 3.0) -> Optional[str]:
-    """Minimalist raw DNS CNAME query over UDP."""
+def _raw_cname_query(host: str, timeout: float = 3.0,
+                     dns_servers: Optional[List[str]] = None) -> Optional[str]:
+    """Minimalist raw DNS CNAME query over UDP. Tries each DNS server in order."""
     import struct, random
+
+    if dns_servers is None:
+        dns_servers = _DNS_SERVERS
 
     def encode_name(name: str) -> bytes:
         parts = name.rstrip(".").split(".")
@@ -270,7 +260,7 @@ def _raw_cname_query(host: str, timeout: float = 3.0) -> Optional[str]:
             if length == 0:
                 offset += 1
                 break
-            elif (length & 0xC0) == 0xC0:          # pointer
+            elif (length & 0xC0) == 0xC0:
                 ptr = ((length & 0x3F) << 8) | data[offset + 1]
                 offset += 2
                 label, _ = decode_name(data, ptr)
@@ -284,48 +274,90 @@ def _raw_cname_query(host: str, timeout: float = 3.0) -> Optional[str]:
 
     txid = random.randint(0, 0xFFFF)
     qname = encode_name(host)
-    # flags: standard query, recursion desired
     header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)
     question = qname + struct.pack(">HH", 5, 1)   # QTYPE=CNAME(5), QCLASS=IN(1)
     packet = header + question
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
-    try:
-        sock.sendto(packet, ("8.8.8.8", 53))
-        resp, _ = sock.recvfrom(512)
-    finally:
-        sock.close()
+    for dns_server in dns_servers:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(packet, (dns_server, 53))
+            resp, _ = sock.recvfrom(512)
+        except Exception:
+            continue
+        finally:
+            sock.close()
 
-    # Parse answer count
-    ancount = struct.unpack(">H", resp[6:8])[0]
-    if ancount == 0:
+        ancount = struct.unpack(">H", resp[6:8])[0]
+        if ancount == 0:
+            return None
+
+        pos = 12
+        while pos < len(resp):
+            ll = resp[pos]
+            if ll == 0:
+                pos += 1
+                break
+            elif (ll & 0xC0) == 0xC0:
+                pos += 2
+                break
+            pos += 1 + ll
+        pos += 4  # QTYPE + QCLASS
+
+        _name, pos = decode_name(resp, pos)
+        if pos + 10 > len(resp):
+            return None
+        rtype, rclass, ttl, rdlength = struct.unpack(">HHIH", resp[pos:pos + 10])
+        pos += 10
+        if rtype == 5:
+            cname_target, _ = decode_name(resp, pos)
+            return cname_target
         return None
 
-    # Skip header (12 bytes) + question section
-    pos = 12
-    # Skip question name
-    while pos < len(resp):
-        ll = resp[pos]
-        if ll == 0:
-            pos += 1
-            break
-        elif (ll & 0xC0) == 0xC0:
-            pos += 2
-            break
-        pos += 1 + ll
-    pos += 4  # QTYPE + QCLASS
-
-    # Parse first answer RR
-    _name, pos = decode_name(resp, pos)
-    if pos + 10 > len(resp):
-        return None
-    rtype, rclass, ttl, rdlength = struct.unpack(">HHIH", resp[pos:pos + 10])
-    pos += 10
-    if rtype == 5:   # CNAME
-        cname_target, _ = decode_name(resp, pos)
-        return cname_target
     return None
+
+
+def resolve_cname_chain(host: str, max_hops: int = 10) -> List[str]:
+    """Follow the full CNAME chain up to max_hops. Returns list of CNAME targets."""
+    chain: List[str] = []
+    current = host
+    seen: set = set()
+
+    for _ in range(max_hops):
+        if current in seen:
+            break
+        seen.add(current)
+
+        # Try dnspython first
+        target = None
+        try:
+            import dns.resolver  # type: ignore
+            answers = dns.resolver.resolve(current, "CNAME")
+            target = str(answers[0].target).rstrip(".")
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        if target is None:
+            try:
+                target = _raw_cname_query(current)
+            except Exception:
+                pass
+
+        if target is None:
+            break
+        chain.append(target)
+        current = target
+
+    return chain
+
+
+def resolve_cname(host: str) -> Optional[str]:
+    """Return the first CNAME target for host (or None)."""
+    chain = resolve_cname_chain(host, max_hops=1)
+    return chain[0] if chain else None
 
 
 def resolve_a(host: str) -> Tuple[Optional[str], bool]:
@@ -341,17 +373,38 @@ def resolve_a(host: str) -> Tuple[Optional[str], bool]:
 
 
 # ---------------------------------------------------------------------------
+# TLS / SSL helpers
+# ---------------------------------------------------------------------------
+def get_tls_sans(host: str, timeout: float = 5.0) -> List[str]:
+    """Connect via TLS and extract Subject Alternative Names from the certificate."""
+    sans: List[str] = []
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+                if cert:
+                    for rdn_type, value in cert.get("subjectAltName", []):
+                        if rdn_type == "DNS":
+                            sans.append(value)
+    except Exception:
+        pass
+    return sans
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-_HTTP_TIMEOUT = 8
-_UA = "Mozilla/5.0 (compatible; SubdomainTakeoverScanner/1.0)"
+_UA = "Mozilla/5.0 (compatible; SubdomainTakeoverScanner/2.0)"
 
 
-def http_get(url: str) -> Tuple[int, str]:
+def http_get(url: str, timeout: int = 8) -> Tuple[int, str]:
     """Return (status_code, body_text). Body is truncated to 8 KB."""
     req = Request(url, headers={"User-Agent": _UA})
     try:
-        with urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             body = resp.read(8192).decode("utf-8", errors="replace")
             return resp.status, body
     except HTTPError as e:
@@ -364,6 +417,19 @@ def http_get(url: str) -> Tuple[int, str]:
         return 0, ""
     except Exception:
         return 0, ""
+
+
+def http_get_with_retry(url: str, retries: int = 2, timeout: int = 8) -> Tuple[int, str]:
+    """HTTP GET with exponential backoff retry on connection failure."""
+    delay = 0.5
+    for attempt in range(retries + 1):
+        status, body = http_get(url, timeout=timeout)
+        if status > 0:
+            return status, body
+        if attempt < retries:
+            time.sleep(delay)
+            delay *= 2
+    return 0, ""
 
 
 # ---------------------------------------------------------------------------
@@ -381,83 +447,121 @@ def check_fingerprint(provider: Provider, body: str) -> bool:
     return provider.http_fingerprint.lower() in body.lower()
 
 
+def load_providers_file(path: str) -> List[Provider]:
+    """Load additional provider fingerprints from a JSON file."""
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    providers: List[Provider] = []
+    for entry in data:
+        providers.append(Provider(
+            name=entry["name"],
+            cname_patterns=entry.get("cname_patterns", []),
+            http_fingerprint=entry.get("http_fingerprint", ""),
+            nxdomain_takeover=entry.get("nxdomain_takeover", True),
+            notes=entry.get("notes", ""),
+        ))
+    return providers
+
+
 # ---------------------------------------------------------------------------
 # Core scan logic
 # ---------------------------------------------------------------------------
-def scan_subdomain(subdomain: str) -> ScanResult:
+def scan_subdomain(subdomain: str, http_timeout: int = 8, retries: int = 2,
+                   enumerate_sans: bool = False) -> ScanResult:
     result = ScanResult(subdomain=subdomain)
 
-    # 1. Resolve CNAME
-    cname = resolve_cname(subdomain)
-    result.cname = cname
+    # 1. Resolve full CNAME chain (up to 10 hops)
+    chain = resolve_cname_chain(subdomain, max_hops=10)
+    result.cname_chain = chain
+    result.chain_depth = len(chain)
+    result.cname = chain[0] if chain else None
 
     # 2. Resolve A record
     ip, nxdomain = resolve_a(subdomain)
     result.ip = ip
     result.nxdomain = nxdomain
 
-    # 3. Match provider from CNAME
+    # 3. Match provider — check every hop in the chain
     provider: Optional[Provider] = None
-    if cname:
-        provider = match_provider_by_cname(cname)
-        if provider:
-            result.provider = provider.name
+    matched_cname: Optional[str] = None
+    for hop in chain:
+        p = match_provider_by_cname(hop)
+        if p:
+            provider = p
+            matched_cname = hop
+            break
+    if provider:
+        result.provider = provider.name
 
-    # 4. Classify severity based on DNS state
-    if nxdomain and cname:
-        # Dangling CNAME → NXDOMAIN = almost certainly takeable
+    # 4. Classify severity
+    if nxdomain and chain:
         result.severity = SEVERITY_CRITICAL
         result.detail = (
-            f"CNAME '{cname}' resolves to NXDOMAIN. "
+            f"CNAME '{chain[-1]}' resolves to NXDOMAIN (chain depth {len(chain)}). "
             f"Provider: {provider.name if provider else 'unknown'}. "
-            "Subdomain is likely claimable."
+            "Subdomain ist wahrscheinlich übernehmbar."
         )
         return result
 
-    if nxdomain and not cname:
-        # Straight NXDOMAIN, no CNAME
+    if nxdomain and not chain:
         result.severity = SEVERITY_INFO
-        result.detail = "Host does not exist (NXDOMAIN, no dangling CNAME)."
+        result.detail = "Host existiert nicht (NXDOMAIN, kein hängender CNAME)."
         return result
 
     if not ip and not nxdomain:
         result.severity = SEVERITY_INFO
-        result.detail = "DNS resolution failed (timeout or other error)."
+        result.detail = "DNS-Auflösung fehlgeschlagen (Timeout oder anderer Fehler)."
         result.error = "DNS timeout"
         return result
 
-    # 5. If there's a provider match, fetch HTTP and check fingerprint
+    # 5. Suspicious chain depth (>3 hops without known provider = dangling risk)
+    if len(chain) > 3 and not provider:
+        result.severity = SEVERITY_MEDIUM
+        result.detail = (
+            f"CNAME-Kette mit {len(chain)} Hops ohne bekannten Provider. "
+            f"Letzte Hop: {chain[-1]}. Manuelle Prüfung empfohlen."
+        )
+
+    # 6. TLS SAN enumeration (reveals additional hostnames from cert)
+    if enumerate_sans and ip:
+        sans = get_tls_sans(subdomain)
+        result.tls_sans = sans
+
+    # 7. HTTP fingerprint check if provider matched
     if provider:
         for scheme in ("https", "http"):
-            status, body = http_get(f"{scheme}://{subdomain}")
+            status, body = http_get_with_retry(
+                f"{scheme}://{subdomain}", retries=retries, timeout=http_timeout
+            )
             if status > 0:
                 result.http_status = status
                 if check_fingerprint(provider, body):
                     result.fingerprint_match = True
                     result.severity = SEVERITY_HIGH
                     result.detail = (
-                        f"HTTP {status}: fingerprint '{provider.http_fingerprint}' "
-                        f"found. Provider: {provider.name}. "
-                        "Subdomain may be claimable."
+                        f"HTTP {status}: Fingerprint '{provider.http_fingerprint}' "
+                        f"gefunden. Provider: {provider.name} via '{matched_cname}'. "
+                        "Subdomain wahrscheinlich übernehmbar."
                     )
                     return result
                 else:
                     result.severity = SEVERITY_MEDIUM
                     result.detail = (
-                        f"CNAME points to {provider.name} ({cname}) but "
-                        "fingerprint not matched. May still be vulnerable."
+                        f"CNAME zeigt auf {provider.name} ({matched_cname}) aber "
+                        "Fingerprint nicht gefunden. Möglicherweise noch angreifbar."
                     )
                     return result
         result.severity = SEVERITY_MEDIUM
         result.detail = (
-            f"CNAME points to {provider.name} ({cname}) but "
-            "HTTP request failed. Manual check recommended."
+            f"CNAME zeigt auf {provider.name} ({matched_cname}) aber "
+            "HTTP-Anfrage fehlgeschlagen. Manuelle Prüfung empfohlen."
         )
         return result
 
-    # 6. Resolved fine, no known provider
-    result.severity = SEVERITY_SAFE
-    result.detail = f"Resolved to {ip}. No known takeover provider detected."
+    # 8. Resolved fine, no known provider
+    if result.severity == SEVERITY_INFO:
+        result.severity = SEVERITY_SAFE
+        result.detail = f"Aufgelöst zu {ip}. Kein bekannter Takeover-Provider erkannt."
     return result
 
 
@@ -541,6 +645,13 @@ def print_result_row(r: ScanResult):
         _col(r.detail,          COL_W["detail"])
     )
     print(c(row, sev_color))
+    if r.tls_sans:
+        print(c(f"    TLS SANs: {', '.join(r.tls_sans[:6])}", DIM))
+    if r.chain_depth > 1:
+        chain_str = " → ".join(r.cname_chain[:5])
+        if r.chain_depth > 5:
+            chain_str += " → …"
+        print(c(f"    CNAME-Kette ({r.chain_depth} Hops): {chain_str}", DIM))
 
 
 def print_summary(results: List[ScanResult]):
@@ -548,9 +659,9 @@ def print_summary(results: List[ScanResult]):
     for r in results:
         counts[r.severity] = counts.get(r.severity, 0) + 1
 
-    print(c("\n=== SCAN SUMMARY ===", BOLD + WHITE))
+    print(c("\n=== SCAN ZUSAMMENFASSUNG ===", BOLD + WHITE))
     total = len(results)
-    print(f"  Total scanned : {total}")
+    print(f"  Gesamt gescannt: {total}")
     for sev in (SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_SAFE, SEVERITY_INFO):
         n = counts.get(sev, 0)
         if n:
@@ -562,25 +673,29 @@ def write_json(results: List[ScanResult], path: str):
     data = []
     for r in results:
         data.append({
-            "subdomain":        r.subdomain,
-            "severity":         r.severity,
-            "provider":         r.provider,
-            "cname":            r.cname,
-            "ip":               r.ip,
-            "nxdomain":         r.nxdomain,
-            "http_status":      r.http_status,
-            "fingerprint_match":r.fingerprint_match,
-            "detail":           r.detail,
-            "error":            r.error,
+            "subdomain":         r.subdomain,
+            "severity":          r.severity,
+            "provider":          r.provider,
+            "cname":             r.cname,
+            "cname_chain":       r.cname_chain,
+            "chain_depth":       r.chain_depth,
+            "ip":                r.ip,
+            "nxdomain":          r.nxdomain,
+            "http_status":       r.http_status,
+            "fingerprint_match": r.fingerprint_match,
+            "tls_sans":          r.tls_sans,
+            "detail":            r.detail,
+            "error":             r.error,
         })
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
-    print(c(f"  [+] JSON report written to {path}", CYAN))
+    print(c(f"  [+] JSON-Report geschrieben: {path}", CYAN))
 
 
 def write_csv(results: List[ScanResult], path: str):
-    fields = ["subdomain", "severity", "provider", "cname", "ip",
-              "nxdomain", "http_status", "fingerprint_match", "detail", "error"]
+    fields = ["subdomain", "severity", "provider", "cname", "chain_depth",
+              "ip", "nxdomain", "http_status", "fingerprint_match",
+              "tls_sans", "detail", "error"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
@@ -590,14 +705,16 @@ def write_csv(results: List[ScanResult], path: str):
                 "severity":          r.severity,
                 "provider":          r.provider or "",
                 "cname":             r.cname or "",
+                "chain_depth":       r.chain_depth,
                 "ip":                r.ip or "",
                 "nxdomain":          r.nxdomain,
                 "http_status":       r.http_status or "",
                 "fingerprint_match": r.fingerprint_match,
+                "tls_sans":          ";".join(r.tls_sans),
                 "detail":            r.detail,
                 "error":             r.error or "",
             })
-    print(c(f"  [+] CSV report written to {path}", CYAN))
+    print(c(f"  [+] CSV-Report geschrieben: {path}", CYAN))
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +743,6 @@ def build_targets(args: argparse.Namespace) -> List[str]:
                 if host and not host.startswith("#"):
                     targets.append(host)
 
-    # Deduplicate while preserving order
     seen: set = set()
     unique: List[str] = []
     for t in targets:
@@ -643,52 +759,68 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="takeover.py",
         description=(
-            "Subdomain Takeover Scanner — checks 35+ provider fingerprints\n"
-            "for dangling CNAMEs and unclaimed hosting slots."
+            "Subdomain Takeover Scanner — prüft 35+ Provider-Fingerprints\n"
+            "auf hängende CNAMEs und nicht beanspruchte Hosting-Slots.\n"
+            "Unterstützt CNAME-Ketten-Analyse, TLS-SAN-Enumeration,\n"
+            "konfigurierbare DNS-Server und eigene Provider-Fingerprints."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
+Beispiele:
   python takeover.py --domain example.com --wordlist wordlist.txt
   python takeover.py --list subdomains.txt --json results.json --csv out.csv
   python takeover.py --domain example.com --wordlist wordlist.txt --workers 50
-  python takeover.py --list targets.txt --no-color
+  python takeover.py --list targets.txt --dns 8.8.8.8,9.9.9.9
+  python takeover.py --list targets.txt --providers-file eigene_provider.json
+  python takeover.py --list targets.txt --tls-sans --only-vulnerable
 
-Exit codes:
-  0  — no CRITICAL or HIGH findings
-  1  — at least one CRITICAL or HIGH finding
-  2  — usage / file error
+Providers-Datei Format (JSON):
+  [{"name": "MeinProvider", "cname_patterns": ["myhost.example.com"],
+    "http_fingerprint": "Account not found", "nxdomain_takeover": true}]
+
+Exit-Codes:
+  0  — keine CRITICAL oder HIGH Funde
+  1  — mindestens ein CRITICAL oder HIGH Fund
+  2  — Verwendungsfehler / Datei-Fehler
 """,
     )
     p.add_argument("--domain", "-d", metavar="DOMAIN",
-                   help="Base domain. Requires --wordlist for enumeration, "
-                        "or scans the apex alone.")
+                   help="Basis-Domain. Benötigt --wordlist für Enumeration, "
+                        "oder scannt nur den Apex.")
     p.add_argument("--wordlist", "-w", metavar="FILE",
-                   help="Wordlist file (one prefix per line). Used with --domain.")
+                   help="Wortlisten-Datei (ein Prefix pro Zeile). Wird mit --domain verwendet.")
     p.add_argument("--list", "-l", metavar="FILE",
-                   help="File with full hostnames to scan (one per line).")
+                   help="Datei mit vollständigen Hostnamen (einer pro Zeile).")
     p.add_argument("--workers", "-t", metavar="N", type=int, default=20,
-                   help="Concurrent worker threads (default: 20).")
+                   help="Parallele Worker-Threads (Standard: 20).")
     p.add_argument("--json", metavar="FILE",
-                   help="Write results as JSON to FILE.")
+                   help="Ergebnisse als JSON in FILE schreiben.")
     p.add_argument("--csv", metavar="FILE",
-                   help="Write results as CSV to FILE.")
+                   help="Ergebnisse als CSV in FILE schreiben.")
     p.add_argument("--no-color", action="store_true",
-                   help="Disable ANSI colour output.")
+                   help="ANSI-Farbausgabe deaktivieren.")
     p.add_argument("--only-vulnerable", action="store_true",
-                   help="Print only CRITICAL and HIGH findings.")
+                   help="Nur CRITICAL und HIGH Funde ausgeben.")
     p.add_argument("--timeout", metavar="SEC", type=int, default=8,
-                   help="HTTP request timeout in seconds (default: 8).")
+                   help="HTTP-Anfrage-Timeout in Sekunden (Standard: 8).")
+    p.add_argument("--retries", metavar="N", type=int, default=2,
+                   help="HTTP-Wiederholungsversuche bei Verbindungsfehlern (Standard: 2).")
+    p.add_argument("--dns", metavar="SERVER[,SERVER]",
+                   help="Kommagetrennte DNS-Server für CNAME-Auflösung (Standard: 8.8.8.8,1.1.1.1).")
+    p.add_argument("--tls-sans", action="store_true",
+                   help="TLS-Zertifikat-SANs auflesen (zeigt weitere Hostnamen aus dem Cert).")
+    p.add_argument("--providers-file", metavar="FILE",
+                   help="JSON-Datei mit eigenen Provider-Fingerprints (wird mit Built-ins zusammengeführt).")
     p.add_argument("--providers", action="store_true",
-                   help="List all built-in provider fingerprints and exit.")
+                   help="Alle eingebauten Provider-Fingerprints auflisten und beenden.")
     return p
 
 
 def list_providers():
-    print(c("\nBuilt-in Provider Fingerprints", BOLD + WHITE))
+    print(c("\nEingebaute Provider-Fingerprints", BOLD + WHITE))
     print(c("-" * 80, DIM))
-    fmt = f"  {{:<25}} {{:<35}} {{}}"
-    print(c(fmt.format("PROVIDER", "CNAME PATTERN(S)", "HTTP FINGERPRINT"), BOLD))
+    fmt = "  {:<25} {:<35} {}"
+    print(c(fmt.format("PROVIDER", "CNAME-MUSTER", "HTTP-FINGERPRINT"), BOLD))
     print(c("-" * 80, DIM))
     for prov in PROVIDERS:
         patterns = ", ".join(prov.cname_patterns[:2])
@@ -700,7 +832,7 @@ def list_providers():
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    global USE_COLOR, _HTTP_TIMEOUT
+    global USE_COLOR, _DNS_SERVERS, _CNAME_INDEX
 
     parser = build_parser()
     args = parser.parse_args()
@@ -712,29 +844,53 @@ def main():
     if args.no_color:
         USE_COLOR = False
 
-    if args.timeout:
-        _HTTP_TIMEOUT = args.timeout
+    # Configurable DNS servers
+    if args.dns:
+        _DNS_SERVERS = [s.strip() for s in args.dns.split(",") if s.strip()]
+
+    # Load extra provider fingerprints
+    if args.providers_file:
+        try:
+            extra = load_providers_file(args.providers_file)
+            PROVIDERS.extend(extra)
+            for prov in extra:
+                for pat in prov.cname_patterns:
+                    _CNAME_INDEX[pat.lower()] = prov
+            print(c(f"  [+] {len(extra)} externe Provider geladen aus {args.providers_file}", CYAN))
+        except Exception as e:
+            print(c(f"  [!] Provider-Datei konnte nicht geladen werden: {e}", YELLOW),
+                  file=sys.stderr)
 
     if not args.domain and not args.list:
-        parser.error("Specify --domain or --list (or both).")
+        parser.error("--domain oder --list (oder beides) angeben.")
 
     targets = build_targets(args)
     if not targets:
-        print(c("[!] No targets found. Check --domain / --list / --wordlist.", YELLOW),
+        print(c("[!] Keine Ziele gefunden. --domain / --list / --wordlist prüfen.", YELLOW),
               file=sys.stderr)
         sys.exit(2)
 
+    http_timeout = args.timeout
+    retries = args.retries
+    enumerate_sans = args.tls_sans
+
     print(c(f"\n[*] Subdomain Takeover Scanner", BOLD + CYAN))
-    print(c(f"[*] Targets  : {len(targets)}", CYAN))
-    print(c(f"[*] Workers  : {args.workers}", CYAN))
-    print(c(f"[*] Providers: {len(PROVIDERS)} fingerprints loaded", CYAN))
+    print(c(f"[*] Ziele     : {len(targets)}", CYAN))
+    print(c(f"[*] Worker    : {args.workers}", CYAN))
+    print(c(f"[*] Provider  : {len(PROVIDERS)} Fingerprints geladen", CYAN))
+    print(c(f"[*] DNS       : {', '.join(_DNS_SERVERS)}", CYAN))
+    if enumerate_sans:
+        print(c(f"[*] TLS SANs  : aktiviert", CYAN))
 
     _init_progress(len(targets))
     results: List[ScanResult] = []
     results_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        future_map = {pool.submit(scan_subdomain, t): t for t in targets}
+        future_map = {
+            pool.submit(scan_subdomain, t, http_timeout, retries, enumerate_sans): t
+            for t in targets
+        }
         for future in as_completed(future_map):
             host = future_map[future]
             try:
@@ -748,7 +904,6 @@ def main():
 
     _finish_progress()
 
-    # Sort: CRITICAL first, then HIGH, MEDIUM, INFO, SAFE
     SEV_ORDER = {
         SEVERITY_CRITICAL: 0,
         SEVERITY_HIGH:     1,
@@ -774,8 +929,8 @@ def main():
     critical_high = [r for r in results
                      if r.severity in (SEVERITY_CRITICAL, SEVERITY_HIGH)]
     if critical_high:
-        print(c(f"[!] {len(critical_high)} CRITICAL/HIGH finding(s) detected. "
-                "Exit code 1.", RED + BOLD))
+        print(c(f"[!] {len(critical_high)} CRITICAL/HIGH Fund(e) erkannt. "
+                "Exit-Code 1.", RED + BOLD))
         sys.exit(1)
     sys.exit(0)
 
