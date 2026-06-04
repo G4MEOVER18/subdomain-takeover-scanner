@@ -235,3 +235,7 @@ Wenn dir das Tool Zeit gespart oder einen echten Bug gebracht hat, freue ich mic
 MIT License — Copyright (c) 2026 G4MEOVER18
 
 Vollständige Bedingungen: [LICENSE](LICENSE)
+
+## Preview
+
+![CLI Preview](docs/screenshots/preview.png)
