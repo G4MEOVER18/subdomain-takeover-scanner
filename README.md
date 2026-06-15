@@ -226,6 +226,8 @@ jobs:
 Wenn dir das Tool Zeit gespart oder einen echten Bug gebracht hat, freue ich mich über eine kleine Spende:
 
 **Bitcoin:** `39vZWmnUwDReQ15BwqQXzyqVQ6U8LardEf`
+
+**Kontakt:** [g4me.over.18@gmail.com](mailto:g4me.over.18@gmail.com)
 **PayPal:** [paypal.me/Freakbank1](https://paypal.me/Freakbank1)
 
 ---
