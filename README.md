@@ -1,5 +1,7 @@
 # subdomain-takeover-scanner
 
+[![CI](https://github.com/G4MEOVER18/subdomain-takeover-scanner/actions/workflows/python-lint.yml/badge.svg)](https://github.com/G4MEOVER18/subdomain-takeover-scanner/actions/workflows/python-lint.yml)
+
 Ein umfassender, parallelisierter **Subdomain-Takeover-Scanner** in reinem Python 3 — keine externen Abhängigkeiten nötig.  
 Prüft über 35 Provider-Fingerprints, erkennt hängende CNAMEs und stuft Befunde nach Schweregrad ein.
 
